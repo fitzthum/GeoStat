@@ -16,6 +16,7 @@ from os import path
 from getpass import getpass
 
 import pandas as pd
+import numpy as np
 import plotly.express as px
 
 DB_PATH = "GeoData.db"
@@ -24,7 +25,9 @@ BASE_URL = "https://www.geoguessr.com"
 API_BASE_URL = "{}/api/v3".format(BASE_URL)
 USER_ID = "5ef7a86a7410d364c0f3f68e"
 
-MODES = ['scrape','scores_over_time']
+DISTANCE_DIVISOR = 1609.34 # conversion for distance unit displayed on map
+
+MODES = ['scrape','scores_over_time','guess_quality','location_difficulty','list_maps']
 SESSION = requests.Session()
 
 def get(url, debug=False):
@@ -84,7 +87,6 @@ def scrape_game_data_map(game_id):
   for setting in data['game']['settings'].keys():
     data['game'][setting] = data['game']['settings'][setting]
 
-  pprint.pprint(data['game'])
   return data
 
 
@@ -100,7 +102,7 @@ def scrape_game_history():
 
   social_feed = []
   while True:
-    social_feed_url = "{}/social/feed/?count={}&page={}" \
+    social_feed_url = "{}/social/feed/me?count={}&page={}" \
         .format(API_BASE_URL, page_size, page_count)
 
     r = get(social_feed_url)
@@ -125,20 +127,20 @@ def init_db():
   cur = con.cursor()
 
   cur.execute('''CREATE TABLE games
-                 (game_id text, date text, map_name text, map_slug text, score real,
+                 (game_id text primary key, date text, map_name text, map_slug text, score real,
                   min_lat real, min_lon real, max_lat real, max_lon real,
                   no_move, no_rotate, no_zoom, game_type, time_limit)''')
 
 
   cur.execute('''CREATE TABLE rounds
-                 (game_id text, map_name text, map_slug text,
+                 (game_id text key, map_name text, map_slug text, guess_score integer,
                  guess_lat real, guess_lon real, guess_time integer, guess_distance real,
                  loc_lat real, loc_lon real)''')
 
   con.commit()
   con.close()
 
-def populate_db():
+def populate_db(limit):
   profile_data = scrape_profile_info()
   user_id = profile_data['id']
 
@@ -149,12 +151,7 @@ def populate_db():
 
   n = 0
   print('Populating Database')
-  for game in progressbar(game_feed):
-    if n > 4:
-      con.commit()
-      con.close()
-
-      return
+  for game in progressbar(game_feed[:limit]):
 
     # only support "challenges" and "maps" at the moment
     activity_type = game['activityType']
@@ -169,7 +166,12 @@ def populate_db():
 
     n += 1
     if activity_type == 8:
-      game_data = scrape_game_data(game_id, user_id)['game']
+      try:
+        game_data = scrape_game_data(game_id, user_id)['game']
+      except:
+        print("Could not get map: {} on {} ({})".format(map_name, game_date, game_id))
+        continue
+
     elif activity_type == 3:
       game_data = scrape_game_data_map(game_id)['game']
 
@@ -197,15 +199,16 @@ def populate_db():
       guess_lon = guess['lng']
       guess_time = guess['time']
       guess_distance = guess['distanceInMeters']
+      guess_score = guess['roundScore']['amount']
 
       loc = game_data['rounds'][i]
       loc_lat = loc['lat']
       loc_lon = loc['lng']
 
-      cur.execute('''INSERT INTO rounds VALUES (?, ?, ?,
+      cur.execute('''INSERT INTO rounds VALUES (?, ?, ?, ?,
                                                 ?, ?, ?, ?,
                                                 ?, ?)''', \
-                      (game_id, map_name, map_slug, \
+                      (game_id, map_name, map_slug, guess_score, \
                        guess_lat, guess_lon, guess_time, guess_distance, \
                        loc_lat, loc_lon))
 
@@ -249,6 +252,77 @@ def scores_over_time(map_slug=None):
             title="Scores Over Time", labels=labels)
   fig.show()
 
+'''
+  Plot each location you have guessed and color
+  by how close the guess was to the true location.
+
+  Will show you where you tend to guess well and
+  where you should probably stop guessing.
+'''
+def guess_quality(map_slug=None):
+  con = sqlite3.connect(DB_PATH)
+
+  if map_slug:
+    rounds = pd.read_sql_query("SELECT * FROM rounds WHERE map_slug = ?", \
+        con, params=[map_slug])
+  else:
+    rounds = pd.read_sql_query("SELECT * FROM rounds", con)
+
+  rounds['guess_score'] = pd.to_numeric(rounds.guess_score)
+  rounds['guess_distance'] /= DISTANCE_DIVISOR
+
+  fig = px.scatter_mapbox(rounds, lat="guess_lat", lon="guess_lon", color="guess_score", \
+                      hover_data = ["guess_distance", "map_name"], zoom=2, \
+                      color_continuous_scale=px.colors.diverging.RdYlGn)
+
+  fig.update_layout(mapbox_style="open-street-map")
+  fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0})
+  fig.show()
+
+
+'''
+  Plot each true location and color by how far off you were on that round.
+
+  This should show you where locations tend to be in the games that you play
+  (should converge to the map of all coverage as you play more games). It
+  should also give you an idea of which parts of the world are more difficult
+  for you.
+
+  TODO: maybe just combine this function and the above, given that they are
+        basically the same
+'''
+def location_difficulty(map_slug=None):
+  con = sqlite3.connect(DB_PATH)
+  if map_slug:
+    rounds = pd.read_sql_query("SELECT * FROM rounds WHERE map_slug = ?", \
+        con, params=[map_slug])
+  else:
+    rounds = pd.read_sql_query("SELECT * FROM rounds", con)
+
+  rounds['guess_score'] = pd.to_numeric(rounds.guess_score)
+  rounds['guess_distance'] /= DISTANCE_DIVISOR
+
+  fig = px.scatter_mapbox(rounds, lat="loc_lat", lon="loc_lon", color="guess_score", \
+                      hover_data = ["guess_distance", "map_name"], zoom=2, \
+                      color_continuous_scale=px.colors.diverging.RdYlGn)
+
+  fig.update_layout(mapbox_style="open-street-map")
+  fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0})
+  fig.show()
+
+'''
+  List all the maps you have played.
+'''
+def list_maps():
+  con = sqlite3.connect(DB_PATH)
+  query = '''SELECT map_name, map_slug, COUNT(map_slug) as count, AVG(score) as average_score
+             FROM games
+             GROUP BY map_slug ORDER BY COUNT(map_slug) DESC'''
+
+  maps = pd.read_sql_query(query, con)
+  pprint.pprint(maps)
+
+
 def main(args):
   if args.mode == "scrape":
     # loading database
@@ -261,16 +335,26 @@ def main(args):
 
     authenticate()
     init_db()
-    populate_db()
+    populate_db(args.limit)
 
   elif args.mode == "scores_over_time":
     scores_over_time(args.map)
+
+  elif args.mode == "guess_quality":
+    guess_quality(args.map)
+
+  elif args.mode == "location_difficulty":
+    location_difficulty(args.map)
+
+  elif args.mode == "list_maps":
+    list_maps()
 
 if __name__ == "__main__":
   parser = ArgumentParser(prog="GeoStat.py", description="Statistics Engine for GeoGuessr")
   parser.add_argument("mode",choices=MODES)
   parser.add_argument("-f","--force", action="store_true")
   parser.add_argument("-m","--map", help="Map Slug (find this in the url of the map page)")
+  parser.add_argument("-l","--limit", help="Limit number of scores scraped", type=int)
 
   args = parser.parse_args()
   main(args)
